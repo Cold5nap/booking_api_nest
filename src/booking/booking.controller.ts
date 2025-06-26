@@ -55,8 +55,8 @@ export class BookingController {
 
   @Post()
   @ApiOperation({ summary: 'Бронирование номера' })
-  @ApiResponse({ status: 201, description: 'Комната создана' })
-  @ApiResponse({ status: 409, description: 'Комната занята' })
+  @ApiResponse({ status: 201, description: 'Комната успешно забронирована' })
+  @ApiResponse({ status: 409, description: 'Комната занята, попробуйте выбрать другую' })
   async create(@Body() createBookingDto: CreateBookingDto) {
     return this.bookingService.createBooking(createBookingDto);
   }
