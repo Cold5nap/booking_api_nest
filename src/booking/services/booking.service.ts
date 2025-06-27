@@ -1,6 +1,6 @@
 import { Injectable, ConflictException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, Between, MoreThanOrEqual, LessThanOrEqual } from 'typeorm';
+import { Repository, Between, MoreThanOrEqual, LessThanOrEqual, DataSource } from 'typeorm';
 import { Booking } from '../entities/booking.entity';
 import { Room } from '../entities/room.entity';
 import { CreateBookingDto } from '../dto/create-booking.dto';
@@ -15,6 +15,7 @@ export class BookingService {
     @InjectRepository(Room)
     private readonly roomRepository: Repository<Room>,
     private readonly httpService: HttpService,
+    private readonly dataSource: DataSource,
   ) {}
 
   async findAllBooking(): Promise<Booking[]> {
@@ -35,7 +36,6 @@ export class BookingService {
     });
 
     const bookedRoomIds = overlappingBookings.map((booking) => booking.room.id);
-
     const query = this.roomRepository.createQueryBuilder('room');
 
     if (bookedRoomIds.length > 0) {
@@ -47,51 +47,63 @@ export class BookingService {
 
   async createBooking(createBookingDto: CreateBookingDto): Promise<Booking> {
     const { roomId, startDate, endDate, guestEmail } = createBookingDto;
+
+    // Валидация дат
     if (endDate < startDate) {
-      throw new ConflictException(
-        'Дата занятия номера не может быть позже выселения ',
-      );
-    }
-    const isAvailable = await this.isRoomAvailable(roomId, startDate, endDate);
-    if (!isAvailable) {
-      throw new ConflictException(`Номер занят с ${startDate} по ${endDate}`);
+      throw new ConflictException('Дата заселения не может быть позже даты выселения');
     }
 
-    // проверка вип статуса
-    const isVip = await this.checkVipStatus(guestEmail);
+    // Атомарность при бронировании
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
 
-    const room = await this.roomRepository.findOneBy({ id: roomId });
-    if (!room) {
-      throw new ConflictException('Такого номера не существует');
+    try {
+      // Проверяем доступность номера в рамках транзакции
+      const room = await queryRunner.manager.findOne(Room, {
+        where: { id: roomId },
+        lock: { mode: 'pessimistic_write' },
+      });
+
+      if (!room) {
+        throw new ConflictException('Такого номера не существует');
+      }
+
+      const overlappingBooking = await queryRunner.manager.findOne(Booking, {
+        where: {
+          room: { id: roomId },
+          startDate: LessThanOrEqual(endDate),
+          endDate: MoreThanOrEqual(startDate),
+        },
+      });
+
+      if (overlappingBooking) {
+        throw new ConflictException(`Номер занят с ${startDate} по ${endDate}`);
+      }
+
+      // Проверка VIP статуса
+      const isVip = await this.checkVipStatus(guestEmail);
+
+      // Создаем бронирование
+      const booking = this.bookingRepository.create({
+        ...createBookingDto,
+        isVip,
+        room,
+      });
+	  // Добавлена атомарность
+      const savedBooking = await queryRunner.manager.save(booking);
+      await queryRunner.commitTransaction();
+      return savedBooking;
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
     }
-
-    const booking = this.bookingRepository.create({
-      ...createBookingDto,
-      isVip,
-      room,
-    });
-
-    return this.bookingRepository.save(booking);
   }
 
   async cancelBooking(id: number): Promise<void> {
     await this.bookingRepository.delete(id);
-  }
-
-  private async isRoomAvailable(
-    roomId: number,
-    startDate: Date,
-    endDate: Date,
-  ): Promise<boolean> {
-    const overlappingBooking = await this.bookingRepository.findOne({
-      where: {
-        room: { id: roomId },
-        startDate: LessThanOrEqual(endDate),
-        endDate: MoreThanOrEqual(startDate),
-      },
-    });
-
-    return !overlappingBooking;
   }
 
   private async checkVipStatus(email: string): Promise<boolean> {
@@ -100,9 +112,9 @@ export class BookingService {
         this.httpService.get(`https://your_api_check?email=${email}`),
       );
       return response.data.isVip;
-	} catch (error) {
-		return false
-      throw new Error('Ошибка при обращении к api для проверки vip статуса');
+    } catch (error) {
+		return false;
+		throw new Error('Ошибка при обращении к api для проверки vip статуса');
     }
   }
 }
